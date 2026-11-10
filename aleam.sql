@@ -38,6 +38,9 @@ BEGIN
       'VIEW:V_UNPAID_PENALTIES',
       'VIEW:V_LAB_UTILISATION',
       'VIEW:V_STUDENT_LAB_ATTENDANCE',
+      'VIEW:V_PENALTY_COLLECTIONS',
+      'VIEW:V_STAFF_ACTIVITY',
+      'VIEW:V_LAB_SESSION_LOG',
       'TRIGGER:TRG_BORROW_BEFORE_INSERT',
       'TRIGGER:TRG_BORROW_AFTER_INSERT',
       'TRIGGER:TRG_BORROW_RETURN',
@@ -48,6 +51,12 @@ BEGIN
       'PROCEDURE:SP_LOG_ATTENDANCE',
       'PROCEDURE:SP_PAY_PENALTY',
       'PROCEDURE:SP_CHECK_OVERDUE',
+      'PROCEDURE:SP_SESSION_LOGIN',
+      'PROCEDURE:SP_SESSION_LOGOUT',
+      'PROCEDURE:SP_SESSION_HEARTBEAT',
+      'PROCEDURE:SP_REPORT_INTERVAL',
+      'PROCEDURE:SP_REPORT_STAFF',
+      'PROCEDURE:SP_REPORT_LAB',
       'FUNCTION:FN_ATTENDANCE_PCT'
   ))) LOOP
     BEGIN
@@ -62,9 +71,9 @@ END;
 -- Children first, so foreign keys never block the drop.
 BEGIN
   FOR t IN (SELECT column_value AS tn FROM TABLE(sys.odcivarchar2list(
-      'Notification', 'Borrows', 'Lab_Attendance', 'Lab', 'Penalty', 'Qualification',
-      'Student_Address', 'Item_Unit', 'Student', 'Staff', 'System_Account',
-      'Equipment_Model', 'Postal_Codes', 'Department'
+      'Active_Session', 'Lab_Enrollment', 'Notification', 'Borrows', 'Lab_Attendance',
+      'Lab', 'Penalty', 'Qualification', 'Student_Address', 'Item_Unit', 'Student',
+      'Staff', 'System_Account', 'Equipment_Model', 'Postal_Codes', 'Department'
   ))) LOOP
     BEGIN
       EXECUTE IMMEDIATE 'DROP TABLE ' || t.tn || ' CASCADE CONSTRAINTS PURGE';
@@ -216,6 +225,41 @@ CREATE TABLE Notification (
 
 CREATE INDEX idx_notification_recipient ON Notification (Recipient_type, Recipient_id, Is_read);
 
+-- ============================================================================
+-- 1.1  EXTENSIONS: concurrent-login lock, report data, lab enrolment
+-- ============================================================================
+
+-- One row per logged-in account. The PRIMARY KEY on Username is the lock: a
+-- second INSERT for the same user fails, even from another window or process.
+-- Last_seen is refreshed by the app's heartbeat so a crashed window can be
+-- recognised as stale. ON DELETE CASCADE lets the admin delete an account that
+-- still has a session row.
+CREATE TABLE Active_Session (
+  Username   VARCHAR2(50) PRIMARY KEY
+             REFERENCES System_Account(Username) ON DELETE CASCADE,
+  Login_time DATE DEFAULT SYSDATE NOT NULL,
+  Last_seen  DATE DEFAULT SYSDATE NOT NULL
+);
+
+-- Which students are enrolled in which lab (M:N), independent of attendance.
+CREATE TABLE Lab_Enrollment (
+  Student_id VARCHAR2(20) REFERENCES Student(Student_id),
+  Lab_id     NUMBER       REFERENCES Lab(Lab_id),
+  PRIMARY KEY (Student_id, Lab_id)
+);
+
+-- Who collected a penalty and when (needed for date-range and per-staff reports).
+ALTER TABLE Penalty ADD (
+  Paid_date    DATE,
+  Collected_by VARCHAR2(20) CONSTRAINT fk_penalty_collected_by REFERENCES Staff(Staff_id)
+);
+
+-- Optional link from a checkout to the lab it was issued for (nullable, so
+-- existing checkouts and the current seed rows stay valid).
+ALTER TABLE Borrows ADD (
+  Lab_id NUMBER CONSTRAINT fk_borrows_lab REFERENCES Lab(Lab_id)
+);
+
 
 -- ============================================================================
 -- 2. VIEWS
@@ -313,6 +357,51 @@ SELECT m.Model_id,
 FROM Equipment_Model m
 LEFT JOIN Item_Unit u ON m.Model_id = u.Model_id
 GROUP BY m.Model_id, m.Model_name, m.Total_quantity;
+
+-- Paid penalties with who collected them and when.
+CREATE OR REPLACE VIEW v_penalty_collections AS
+SELECT p.Penalty_id,
+       p.Student_id,
+       s.First_name || ' ' || s.Last_name AS Student_name,
+       p.Amount,
+       p.Paid_date,
+       p.Collected_by,
+       st.Staff_name AS Collected_by_name
+FROM Penalty p
+JOIN Student s    ON p.Student_id   = s.Student_id
+LEFT JOIN Staff st ON p.Collected_by = st.Staff_id
+WHERE p.Payment_status = 'Paid';
+
+-- One row per staff member with their headline activity figures.
+CREATE OR REPLACE VIEW v_staff_activity AS
+SELECT st.Staff_id,
+       st.Staff_name,
+       st.Role,
+       d.Department_name,
+       (SELECT COUNT(*) FROM Lab l WHERE l.Staff_id = st.Staff_id)      AS Labs_supervised,
+       (SELECT COUNT(*) FROM Borrows b WHERE b.Staff_id = st.Staff_id)  AS Items_issued,
+       (SELECT COUNT(*) FROM Penalty p
+         WHERE p.Collected_by = st.Staff_id AND p.Payment_status = 'Paid') AS Penalties_collected,
+       (SELECT NVL(SUM(p.Amount), 0) FROM Penalty p
+         WHERE p.Collected_by = st.Staff_id AND p.Payment_status = 'Paid') AS Dues_collected
+FROM Staff st
+LEFT JOIN Department d ON st.Department_id = d.Department_id;
+
+-- One row per lab session date per recording staff member.
+CREATE OR REPLACE VIEW v_lab_session_log AS
+SELECT l.Lab_id,
+       l.Lab_name,
+       l.Course_code,
+       a.Session_date,
+       a.Staff_id,
+       st.Staff_name,
+       COUNT(*) AS Total_marked,
+       COUNT(CASE WHEN a.Status = 'Present' THEN 1 END) AS Present_count,
+       COUNT(CASE WHEN a.Status = 'Absent'  THEN 1 END) AS Absent_count
+FROM Lab_Attendance a
+JOIN Lab   l  ON a.Lab_id   = l.Lab_id
+JOIN Staff st ON a.Staff_id = st.Staff_id
+GROUP BY l.Lab_id, l.Lab_name, l.Course_code, a.Session_date, a.Staff_id, st.Staff_name;
 
 
 -- ============================================================================
@@ -531,6 +620,27 @@ COMPOUND TRIGGER
 END trg_attendance_shortage;
 /
 
+-- ---------------------------------------------------------------------------
+-- 4.6  BEFORE INSERT OR UPDATE OF Payment_status on Penalty
+--      Stamps Paid_date automatically when a penalty becomes 'Paid' (unless a
+--      date was supplied explicitly), and clears the payment details if a
+--      penalty goes back to 'Unpaid'.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE TRIGGER trg_penalty_paid_stamp
+BEFORE INSERT OR UPDATE OF Payment_status ON Penalty
+FOR EACH ROW
+BEGIN
+  IF :NEW.Payment_status = 'Paid' THEN
+    IF :NEW.Paid_date IS NULL THEN
+      :NEW.Paid_date := SYSDATE;
+    END IF;
+  ELSE
+    :NEW.Paid_date    := NULL;
+    :NEW.Collected_by := NULL;
+  END IF;
+END trg_penalty_paid_stamp;
+/
+
 
 -- ============================================================================
 -- 5. PROCEDURES
@@ -546,6 +656,7 @@ CREATE OR REPLACE PROCEDURE sp_checkout_item (
   p_student_id IN  VARCHAR2,
   p_barcode    IN  VARCHAR2,
   p_staff_id   IN  VARCHAR2,
+  p_lab_id     IN  NUMBER,
   p_result     OUT VARCHAR2,
   p_message    OUT VARCHAR2
 ) IS
@@ -592,8 +703,17 @@ BEGIN
     RETURN;
   END IF;
 
-  INSERT INTO Borrows (Student_id, Model_id, Unit_barcode, Checkout_date, Due_date, Staff_id)
-  VALUES (p_student_id, v_model_id, p_barcode, SYSDATE, SYSDATE + 7, p_staff_id);
+    IF p_lab_id IS NOT NULL THEN
+    SELECT COUNT(*) INTO v_cnt FROM Lab WHERE Lab_id = p_lab_id;
+    IF v_cnt = 0 THEN
+      p_result := 'ERROR';
+      p_message := 'No lab found with id ' || p_lab_id || '.';
+      RETURN;
+    END IF;
+  END IF;
+
+  INSERT INTO Borrows (Student_id, Model_id, Unit_barcode, Checkout_date, Due_date, Staff_id, Lab_id)
+  VALUES (p_student_id, v_model_id, p_barcode, SYSDATE, SYSDATE + 7, p_staff_id, p_lab_id);
 
   p_result := 'OK';
   p_message := 'Issued ' || p_barcode || ' to ' || p_student_id || '.' || CHR(10) ||
@@ -728,6 +848,7 @@ END sp_log_attendance;
 CREATE OR REPLACE PROCEDURE sp_pay_penalty (
   p_student_id IN  VARCHAR2,
   p_penalty_id IN  NUMBER,
+  p_staff_id   IN  VARCHAR2,
   p_result     OUT VARCHAR2,
   p_message    OUT VARCHAR2
 ) IS
@@ -752,8 +873,9 @@ BEGIN
     RETURN;
   END IF;
 
-  UPDATE Penalty
-     SET Payment_status = 'Paid'
+    UPDATE Penalty
+     SET Payment_status = 'Paid',
+         Collected_by   = p_staff_id
    WHERE Student_id = p_student_id AND Penalty_id = p_penalty_id;
 
   -- Close the student's matching notification so it stops nagging them.
@@ -821,6 +943,395 @@ EXCEPTION
     ROLLBACK;
     RAISE;
 END sp_check_overdue;
+/
+
+-- ---------------------------------------------------------------------------
+-- 5.6  Concurrent-login lock. The PRIMARY KEY on Active_Session.Username is
+--      the lock itself; a session not refreshed for 2 minutes counts as dead.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE sp_session_login (
+  p_username IN  VARCHAR2,
+  p_result   OUT VARCHAR2,
+  p_message  OUT VARCHAR2
+) IS
+BEGIN
+  DELETE FROM Active_Session
+   WHERE Username = p_username
+     AND Last_seen < SYSDATE - (2 / 1440);       -- stale: crashed window
+
+  INSERT INTO Active_Session (Username) VALUES (p_username);
+  COMMIT;
+  p_result  := 'OK';
+  p_message := 'Session started.';
+EXCEPTION
+  WHEN DUP_VAL_ON_INDEX THEN
+    ROLLBACK;
+    p_result  := 'ERROR';
+    p_message := 'This account is already logged in on another window.';
+  WHEN OTHERS THEN
+    ROLLBACK;
+    p_result  := 'ERROR';
+    p_message := SQLERRM;
+END sp_session_login;
+/
+
+CREATE OR REPLACE PROCEDURE sp_session_logout (
+  p_username IN  VARCHAR2,
+  p_result   OUT VARCHAR2,
+  p_message  OUT VARCHAR2
+) IS
+BEGIN
+  DELETE FROM Active_Session WHERE Username = p_username;
+  COMMIT;
+  p_result  := 'OK';
+  p_message := 'Session closed.';
+EXCEPTION
+  WHEN OTHERS THEN
+    ROLLBACK;
+    p_result  := 'ERROR';
+    p_message := SQLERRM;
+END sp_session_logout;
+/
+
+-- Refreshes Last_seen. If the row vanished (e.g. the machine slept past the
+-- timeout) it tries to reclaim it; ERROR means someone else now holds it.
+CREATE OR REPLACE PROCEDURE sp_session_heartbeat (
+  p_username IN  VARCHAR2,
+  p_result   OUT VARCHAR2,
+  p_message  OUT VARCHAR2
+) IS
+BEGIN
+  UPDATE Active_Session SET Last_seen = SYSDATE WHERE Username = p_username;
+  IF SQL%ROWCOUNT = 0 THEN
+    INSERT INTO Active_Session (Username) VALUES (p_username);
+  END IF;
+  COMMIT;
+  p_result  := 'OK';
+  p_message := 'Heartbeat recorded.';
+EXCEPTION
+  WHEN DUP_VAL_ON_INDEX THEN
+    ROLLBACK;
+    p_result  := 'ERROR';
+    p_message := 'This account was taken over by another window.';
+  WHEN OTHERS THEN
+    ROLLBACK;
+    p_result  := 'ERROR';
+    p_message := SQLERRM;
+END sp_session_heartbeat;
+/
+
+-- ---------------------------------------------------------------------------
+-- 5.7  REPORT A: date interval
+--      Syllabus: aggregates, joins, GROUP BY, HAVING, ORDER BY, subquery in
+--      SELECT, INTERSECT inside an IN-subquery, view (v_penalty_collections).
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE sp_report_interval (
+  p_from            IN  DATE,
+  p_to              IN  DATE,
+  p_attendance      OUT SYS_REFCURSOR,
+  p_lab_summary     OUT SYS_REFCURSOR,
+  p_checkouts       OUT SYS_REFCURSOR,
+  p_penalties       OUT SYS_REFCURSOR,
+  p_totals          OUT SYS_REFCURSOR,
+  p_active_students OUT SYS_REFCURSOR,
+  p_result          OUT VARCHAR2,
+  p_message         OUT VARCHAR2
+) IS
+  v_from DATE := TRUNC(p_from);
+  v_to   DATE := TRUNC(p_to);
+BEGIN
+  IF v_from IS NULL OR v_to IS NULL THEN
+    p_result := 'ERROR';
+    p_message := 'Both a start date and an end date are required.';
+    RETURN;
+  END IF;
+  IF v_from > v_to THEN
+    p_result := 'ERROR';
+    p_message := 'The start date must not be after the end date.';
+    RETURN;
+  END IF;
+
+  OPEN p_attendance FOR
+    SELECT TO_CHAR(a.Session_date, 'DD-MON-YYYY'), a.Student_id,
+           s.First_name || ' ' || s.Last_name, l.Lab_name,
+           NVL(st.Staff_name, '-'), a.Status
+      FROM Lab_Attendance a
+      JOIN Student s ON a.Student_id = s.Student_id
+      JOIN Lab     l ON a.Lab_id     = l.Lab_id
+      LEFT JOIN Staff st ON a.Staff_id = st.Staff_id
+     WHERE TRUNC(a.Session_date) BETWEEN v_from AND v_to
+     ORDER BY a.Session_date, a.Student_id;
+
+  OPEN p_lab_summary FOR
+    SELECT l.Lab_name, l.Course_code,
+           COUNT(*) AS records,
+           COUNT(CASE WHEN a.Status = 'Present' THEN 1 END) AS present_cnt,
+           COUNT(CASE WHEN a.Status = 'Absent'  THEN 1 END) AS absent_cnt,
+           ROUND(COUNT(CASE WHEN a.Status = 'Present' THEN 1 END) * 100 / COUNT(*), 2) AS pct
+      FROM Lab_Attendance a
+      JOIN Lab l ON a.Lab_id = l.Lab_id
+     WHERE TRUNC(a.Session_date) BETWEEN v_from AND v_to
+     GROUP BY l.Lab_id, l.Lab_name, l.Course_code
+    HAVING COUNT(*) >= 2
+     ORDER BY pct, l.Lab_name;
+
+  OPEN p_checkouts FOR
+    SELECT TO_CHAR(b.Checkout_date, 'DD-MON-YYYY'), b.Student_id,
+           s.First_name || ' ' || s.Last_name, m.Model_name, b.Unit_barcode,
+           TO_CHAR(b.Due_date, 'DD-MON-YYYY'),
+           CASE WHEN b.Return_date IS NOT NULL THEN 'Returned'
+                WHEN TRUNC(b.Due_date) < TRUNC(SYSDATE) THEN 'OVERDUE'
+                ELSE 'On loan' END,
+           NVL(st.Staff_name, '-')
+      FROM Borrows b
+      JOIN Student s         ON b.Student_id = s.Student_id
+      JOIN Equipment_Model m ON b.Model_id   = m.Model_id
+      LEFT JOIN Staff st     ON b.Staff_id   = st.Staff_id
+     WHERE TRUNC(b.Checkout_date) BETWEEN v_from AND v_to
+     ORDER BY b.Checkout_date, b.Student_id;
+
+  OPEN p_penalties FOR
+    SELECT pc.Penalty_id, pc.Student_id, pc.Student_name, pc.Amount,
+           TO_CHAR(pc.Paid_date, 'DD-MON-YYYY'),
+           NVL(pc.Collected_by_name, '-'),
+           CASE WHEN pc.Amount > (SELECT AVG(Amount) FROM Penalty)
+                THEN 'Above average' ELSE '-' END
+      FROM v_penalty_collections pc
+     WHERE TRUNC(pc.Paid_date) BETWEEN v_from AND v_to
+     ORDER BY pc.Paid_date, pc.Penalty_id;
+
+  -- FIXED: no outer aggregate mixed with scalar subqueries (was ORA-00937).
+  OPEN p_totals FOR
+    SELECT (SELECT COUNT(*) FROM Lab_Attendance
+             WHERE TRUNC(Session_date) BETWEEN v_from AND v_to) AS att_cnt,
+           (SELECT COUNT(*) FROM Borrows
+             WHERE TRUNC(Checkout_date) BETWEEN v_from AND v_to) AS chk_cnt,
+           (SELECT COUNT(*) FROM v_penalty_collections
+             WHERE TRUNC(Paid_date) BETWEEN v_from AND v_to) AS pen_cnt,
+           (SELECT NVL(SUM(Amount), 0) FROM v_penalty_collections
+             WHERE TRUNC(Paid_date) BETWEEN v_from AND v_to) AS pen_amt
+      FROM dual;
+
+  OPEN p_active_students FOR
+    SELECT s.Student_id, s.First_name || ' ' || s.Last_name,
+           NVL(d.Department_name, '-')
+      FROM Student s
+      LEFT JOIN Department d ON s.Department_id = d.Department_id
+     WHERE s.Student_id IN (
+             SELECT Student_id FROM Lab_Attendance
+              WHERE Status = 'Present'
+                AND TRUNC(Session_date) BETWEEN v_from AND v_to
+             INTERSECT
+             SELECT Student_id FROM Borrows
+              WHERE TRUNC(Checkout_date) BETWEEN v_from AND v_to)
+     ORDER BY s.Student_id;
+
+  p_result  := 'OK';
+  p_message := 'Report generated.';
+EXCEPTION
+  WHEN OTHERS THEN
+    p_result  := 'ERROR';
+    p_message := SQLERRM;
+END sp_report_interval;
+/
+
+-- ---------------------------------------------------------------------------
+-- 5.8  REPORT B: staff activity
+--      Syllabus: view, subquery (share of all dues), UNION, GROUP BY + HAVING,
+--      joins, aggregates, ORDER BY.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE sp_report_staff (
+  p_staff_id    IN  VARCHAR2,
+  p_profile     OUT SYS_REFCURSOR,
+  p_labs        OUT SYS_REFCURSOR,
+  p_checkouts   OUT SYS_REFCURSOR,
+  p_by_model    OUT SYS_REFCURSOR,
+  p_dues        OUT SYS_REFCURSOR,
+  p_result      OUT VARCHAR2,
+  p_message     OUT VARCHAR2
+) IS
+  v_cnt PLS_INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_cnt FROM Staff WHERE Staff_id = p_staff_id;
+  IF v_cnt = 0 THEN
+    p_result := 'ERROR';
+    p_message := 'No staff member found with id ' || p_staff_id || '.';
+    RETURN;
+  END IF;
+
+  -- Department + headline figures from the view; subquery gives their share
+  -- of all dues collected by anyone.
+  OPEN p_profile FOR
+    SELECT v.Staff_id, v.Staff_name, NVL(v.Role, '-'), NVL(v.Department_name, '-'),
+           v.Labs_supervised, v.Items_issued, v.Penalties_collected, v.Dues_collected,
+           NVL(ROUND(100 * v.Dues_collected /
+               NULLIF((SELECT SUM(Amount) FROM Penalty WHERE Payment_status = 'Paid'), 0), 2), 0)
+      FROM v_staff_activity v
+     WHERE v.Staff_id = p_staff_id;
+
+  -- UNION: labs they are in charge of, plus labs they recorded attendance in
+  OPEN p_labs FOR
+    SELECT l.Lab_id, l.Lab_name, l.Course_code
+      FROM Lab l WHERE l.Staff_id = p_staff_id
+    UNION
+    SELECT l.Lab_id, l.Lab_name, l.Course_code
+      FROM Lab l
+     WHERE l.Lab_id IN (SELECT Lab_id FROM Lab_Attendance WHERE Staff_id = p_staff_id)
+     ORDER BY 1;
+
+  -- Every checkout they authorised
+  OPEN p_checkouts FOR
+    SELECT TO_CHAR(b.Checkout_date, 'DD-MON-YYYY'), b.Student_id,
+           s.First_name || ' ' || s.Last_name, m.Model_name, b.Unit_barcode,
+           NVL(l.Lab_name, '-'),
+           CASE WHEN b.Return_date IS NOT NULL THEN 'Returned'
+                WHEN TRUNC(b.Due_date) < TRUNC(SYSDATE) THEN 'OVERDUE'
+                ELSE 'On loan' END
+      FROM Borrows b
+      JOIN Student s         ON b.Student_id = s.Student_id
+      JOIN Equipment_Model m ON b.Model_id   = m.Model_id
+      LEFT JOIN Lab l        ON b.Lab_id     = l.Lab_id
+     WHERE b.Staff_id = p_staff_id
+     ORDER BY b.Checkout_date DESC, b.Student_id;
+
+  -- Checkouts per model (GROUP BY + HAVING + aggregates)
+  OPEN p_by_model FOR
+    SELECT m.Model_name,
+           COUNT(*),
+           COUNT(CASE WHEN b.Return_date IS NULL THEN 1 END),
+           MIN(TO_CHAR(b.Checkout_date, 'DD-MON-YYYY'))
+      FROM Borrows b
+      JOIN Equipment_Model m ON b.Model_id = m.Model_id
+     WHERE b.Staff_id = p_staff_id
+     GROUP BY m.Model_id, m.Model_name
+    HAVING COUNT(*) >= 1
+     ORDER BY COUNT(*) DESC, m.Model_name;
+
+  -- Dues collected (view)
+  OPEN p_dues FOR
+    SELECT pc.Penalty_id, pc.Student_id, pc.Student_name, pc.Amount,
+           TO_CHAR(pc.Paid_date, 'DD-MON-YYYY')
+      FROM v_penalty_collections pc
+     WHERE pc.Collected_by = p_staff_id
+     ORDER BY pc.Paid_date DESC, pc.Penalty_id;
+
+  p_result  := 'OK';
+  p_message := 'Report generated.';
+EXCEPTION
+  WHEN OTHERS THEN
+    p_result  := 'ERROR';
+    p_message := SQLERRM;
+END sp_report_staff;
+/
+
+-- ---------------------------------------------------------------------------
+-- 5.9  REPORT C: lab-wise log
+--      Syllabus: view, GROUP BY + HAVING, aggregates, outer joins, MINUS
+--      inside an IN-subquery, ORDER BY.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE sp_report_lab (
+  p_lab_id        IN  NUMBER,
+  p_sessions      OUT SYS_REFCURSOR,
+  p_staff         OUT SYS_REFCURSOR,
+  p_checkouts     OUT SYS_REFCURSOR,
+  p_enrolled      OUT SYS_REFCURSOR,
+  p_attendance    OUT SYS_REFCURSOR,
+  p_never_present OUT SYS_REFCURSOR,
+  p_result        OUT VARCHAR2,
+  p_message       OUT VARCHAR2
+) IS
+  v_cnt PLS_INTEGER;
+BEGIN
+  SELECT COUNT(*) INTO v_cnt FROM Lab WHERE Lab_id = p_lab_id;
+  IF v_cnt = 0 THEN
+    p_result := 'ERROR';
+    p_message := 'No lab found with id ' || p_lab_id || '.';
+    RETURN;
+  END IF;
+
+  OPEN p_sessions FOR
+    SELECT TO_CHAR(a.Session_date, 'DD-MON-YYYY'),
+           COUNT(*),
+           COUNT(CASE WHEN a.Status = 'Present' THEN 1 END),
+           COUNT(CASE WHEN a.Status = 'Absent'  THEN 1 END),
+           ROUND(COUNT(CASE WHEN a.Status = 'Present' THEN 1 END) * 100 / COUNT(*), 2)
+      FROM Lab_Attendance a
+     WHERE a.Lab_id = p_lab_id
+     GROUP BY a.Session_date
+    HAVING COUNT(*) >= 1
+     ORDER BY a.Session_date;
+
+  OPEN p_staff FOR
+    SELECT TO_CHAR(v.Session_date, 'DD-MON-YYYY'), v.Staff_id, v.Staff_name, v.Total_marked
+      FROM v_lab_session_log v
+     WHERE v.Lab_id = p_lab_id
+     ORDER BY v.Session_date, v.Staff_id;
+
+  OPEN p_checkouts FOR
+    SELECT TO_CHAR(b.Checkout_date, 'DD-MON-YYYY'), b.Student_id,
+           s.First_name || ' ' || s.Last_name, m.Model_name, b.Unit_barcode,
+           NVL(st.Staff_name, '-'),
+           CASE WHEN b.Return_date IS NOT NULL THEN 'Returned'
+                WHEN TRUNC(b.Due_date) < TRUNC(SYSDATE) THEN 'OVERDUE'
+                ELSE 'On loan' END
+      FROM Borrows b
+      JOIN Student s         ON b.Student_id = s.Student_id
+      JOIN Equipment_Model m ON b.Model_id   = m.Model_id
+      LEFT JOIN Staff st     ON b.Staff_id   = st.Staff_id
+     WHERE b.Lab_id = p_lab_id
+     ORDER BY b.Checkout_date, b.Student_id;
+
+  -- Attendance is pre-aggregated per student for THIS lab only, then joined
+  -- 1:1 to the enrolment row, so no row multiplication and no outer GROUP BY.
+  OPEN p_enrolled FOR
+    SELECT s.Student_id,
+           s.First_name || ' ' || s.Last_name,
+           NVL(t.total, 0),
+           NVL(t.present, 0),
+           CASE WHEN NVL(t.total, 0) = 0 THEN 0
+                ELSE ROUND(t.present * 100 / t.total, 2) END,
+           CASE WHEN NVL(t.total, 0) < 5 THEN 'NOT ENOUGH DATA'
+                WHEN t.present * 100 / t.total < 75 THEN 'SHORTAGE'
+                ELSE 'OK' END
+      FROM Lab_Enrollment e
+      JOIN Student s ON s.Student_id = e.Student_id
+      LEFT JOIN (SELECT Student_id,
+                        COUNT(*) AS total,
+                        COUNT(CASE WHEN Status = 'Present' THEN 1 END) AS present
+                   FROM Lab_Attendance
+                  WHERE Lab_id = p_lab_id
+                  GROUP BY Student_id) t
+             ON t.Student_id = e.Student_id
+     WHERE e.Lab_id = p_lab_id
+     ORDER BY s.Student_id;
+
+  OPEN p_attendance FOR
+    SELECT TO_CHAR(a.Session_date, 'DD-MON-YYYY'), a.Student_id,
+           s.First_name || ' ' || s.Last_name,
+           NVL(st.Staff_name, '-'), a.Status
+      FROM Lab_Attendance a
+      JOIN Student s ON a.Student_id = s.Student_id
+      LEFT JOIN Staff st ON a.Staff_id = st.Staff_id
+     WHERE a.Lab_id = p_lab_id
+     ORDER BY a.Session_date, a.Student_id;
+
+  OPEN p_never_present FOR
+    SELECT s.Student_id, s.First_name || ' ' || s.Last_name
+      FROM Student s
+     WHERE s.Student_id IN (
+             SELECT Student_id FROM Lab_Enrollment WHERE Lab_id = p_lab_id
+             MINUS
+             SELECT Student_id FROM Lab_Attendance
+              WHERE Lab_id = p_lab_id AND Status = 'Present')
+     ORDER BY s.Student_id;
+
+  p_result  := 'OK';
+  p_message := 'Report generated.';
+EXCEPTION
+  WHEN OTHERS THEN
+    p_result  := 'ERROR';
+    p_message := SQLERRM;
+END sp_report_lab;
 /
 
 
@@ -1023,31 +1534,57 @@ INSERT INTO Borrows (Student_id, Model_id, Unit_barcode, Checkout_date, Due_date
 
 COMMIT;
 
+-- --- 6.14 Report seed: enrolments, penalty collections, borrow-to-lab links ---
+INSERT INTO Lab_Enrollment (Student_id, Lab_id)
+SELECT x.sid, x.lid FROM (
+  SELECT s.Student_id AS sid, l.Lab_id AS lid FROM Student s, Lab l WHERE l.Lab_id IN (1, 2)
+  UNION ALL SELECT 'STD-01', 3 FROM dual
+  UNION ALL SELECT 'STD-04', 3 FROM dual
+  UNION ALL SELECT 'STD-01', 4 FROM dual
+  UNION ALL SELECT 'STD-02', 4 FROM dual
+) x
+WHERE NOT EXISTS (SELECT 1 FROM Lab_Enrollment e
+                   WHERE e.Student_id = x.sid AND e.Lab_id = x.lid);
+
+-- Only Collected_by / Paid_date change, so trg_penalty_paid_stamp does not fire.
+UPDATE Penalty SET Collected_by = 'STF-01', Paid_date = DATE '2026-09-16'
+ WHERE Student_id = 'STD-02' AND Payment_status = 'Paid';
+UPDATE Penalty SET Collected_by = 'STF-03', Paid_date = DATE '2026-09-22'
+ WHERE Student_id = 'STD-04' AND Payment_status = 'Paid';
+
+UPDATE Borrows SET Lab_id = 1 WHERE Student_id = 'STD-01' AND Unit_barcode = 'DMM-1001';
+UPDATE Borrows SET Lab_id = 2 WHERE Student_id = 'STD-02' AND Unit_barcode = 'OSC-2001';
+UPDATE Borrows SET Lab_id = 1 WHERE Student_id = 'STD-03' AND Unit_barcode = 'SOLD-3001';
+UPDATE Borrows SET Lab_id = 3 WHERE Student_id = 'STD-04' AND Unit_barcode = 'FUNC-4001';
+UPDATE Borrows SET Lab_id = 1 WHERE Student_id = 'STD-05' AND Unit_barcode = 'DMM-1002';
+
+COMMIT;
+
 
 -- ============================================================================
 -- 7. DEMO / VERIFICATION QUERIES
 -- ============================================================================
 
-PROMPT ---- 7.1  What did the triggers generate on their own? ----
+PROMPT ---- 7.1  What did the triggers generate on their own?
 SELECT Notification_type, COUNT(*) AS How_many
 FROM Notification
 GROUP BY Notification_type
 ORDER BY How_many DESC;
 
-PROMPT ---- 7.2  The notification inbox, newest first ----
+PROMPT ---- 7.2  The notification inbox, newest first 
 SELECT Notification_id AS ID, Recipient_type AS Rcpt, Recipient_id AS Rcpt_id,
        Notification_type AS Type, Is_read AS Read_flag,
        TO_CHAR(Created_date, 'DD-MON HH24:MI') AS Created, Message
 FROM Notification
 ORDER BY Notification_id DESC;
 
-PROMPT ---- 7.3  Which units moved to Checked Out on their own? ----
+PROMPT ---- 7.3  Which units moved to Checked Out on their own? 
 SELECT Model_id, Unit_barcode, Item_status FROM Item_Unit ORDER BY Model_id, Unit_barcode;
 
-PROMPT ---- 7.4  Equipment availability (view) ----
+PROMPT ---- 7.4  Equipment availability (view) 
 SELECT Model_name, Unit_barcode, Item_condition, Item_status FROM v_available_equipment ORDER BY Model_name;
 
-PROMPT ---- 7.5  Active loans with an overdue flag (view) ----
+PROMPT ---- 7.5  Active loans with an overdue flag (view) 
 SELECT Student_id, Student_name, Model_name, Unit_barcode,
        TO_CHAR(Checkout_date,'DD-MON-YYYY') AS Checked_out,
        TO_CHAR(Due_date,'DD-MON-YYYY')      AS Due_back,
@@ -1055,37 +1592,37 @@ SELECT Student_id, Student_name, Model_name, Unit_barcode,
 FROM v_active_borrows
 ORDER BY Due_date;
 
-PROMPT ---- 7.6  Attendance league table (view) ----
+PROMPT ---- 7.6  Attendance league table (view) 
 SELECT Student_id, Student_name, Total_sessions, Present_count, Absent_count,
        Attendance_pct, Attendance_status
 FROM v_student_attendance
 ORDER BY Attendance_pct;
 
-PROMPT ---- 7.7  Attendance in WHICH lab, how much (view) ----
+PROMPT ---- 7.7  Attendance in WHICH lab, how much (view) 
 -- The headline case: STD-01 is OK overall yet short in one lab.
 SELECT Student_id, Student_name, Lab_name, Course_code,
        Total_sessions, Present_count, Absent_count, Attendance_pct, Attendance_status
 FROM v_student_lab_attendance
 ORDER BY Student_id, Lab_id;
 
-PROMPT ---- 7.8  Per-lab shortage list (students below 75% in a lab) ----
+PROMPT ---- 7.8  Per-lab shortage list (students below 75% in a lab) 
 SELECT Student_id, Student_name, Lab_name, Attendance_pct
 FROM v_student_lab_attendance
 WHERE Attendance_status = 'SHORTAGE'
 ORDER BY Attendance_pct;
 
-PROMPT ---- 7.9  Outstanding money (view) ----
+PROMPT ---- 7.9  Outstanding money (view) 
 SELECT Student_id, Student_name, Penalty_id, Amount, Payment_status
 FROM v_unpaid_penalties
 ORDER BY Amount DESC;
 
-PROMPT ---- 7.10  Lab utilisation report (view) ----
+PROMPT ---- 7.10  Lab utilisation report (view) 
 SELECT Model_name, Total_quantity, Units_registered, Units_available,
        Units_out, Times_borrowed
 FROM v_lab_utilisation
 ORDER BY Times_borrowed DESC;
 
-PROMPT ---- 7.11  Students currently blocked from borrowing (unpaid dues) ----
+PROMPT ---- 7.11  Students currently blocked from borrowing (unpaid dues) 
 SELECT s.Student_id,
        s.First_name || ' ' || s.Last_name AS Student_name,
        d.Department_name,
@@ -1097,7 +1634,7 @@ WHERE p.Payment_status = 'Unpaid'
 GROUP BY s.Student_id, s.First_name, s.Last_name, d.Department_name
 ORDER BY Total_owed DESC;
 
-PROMPT ---- 7.12  Department-wise borrowing activity ----
+PROMPT ---- 7.12  Department-wise borrowing activity 
 SELECT d.Department_name,
        COUNT(DISTINCT s.Student_id) AS Students,
        COUNT(b.Unit_barcode)        AS Loans
@@ -1107,7 +1644,7 @@ LEFT JOIN Borrows b ON s.Student_id    = b.Student_id
 GROUP BY d.Department_name
 ORDER BY Loans DESC;
 
-PROMPT ---- 7.13  Students who have NEVER returned anything late ----
+PROMPT ---- 7.13  Students who have NEVER returned anything late 
 SELECT Student_id, First_name || ' ' || Last_name AS Student_name
 FROM Student s
 WHERE NOT EXISTS (

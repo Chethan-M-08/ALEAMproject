@@ -23,6 +23,7 @@
 """
 
 import hashlib
+import time
 import hmac
 import secrets
 from datetime import datetime
@@ -79,6 +80,7 @@ class Database:
         try:
             self.conn = oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_DSN)
             self.cursor = self.conn.cursor()
+            self.conn.call_timeout = 20000      # ms
         except Exception as exc:
             messagebox.showerror(
                 "Database Error",
@@ -135,6 +137,18 @@ class Database:
         if not verify_password(password, stored_hash):
             return None
         return role, ref_id
+    
+    def get_display_name(self, role, ref_id):
+        """Full name for the header label."""
+        if role == "ADMIN":
+            return "Administrator"
+        if role == "STUDENT":
+            rows = self._query(
+                "SELECT First_name || ' ' || Last_name FROM Student WHERE Student_id = :1",
+                (ref_id,))
+        else:
+            rows = self._query("SELECT Staff_name FROM Staff WHERE Staff_id = :1", (ref_id,))
+        return rows[0][0] if rows else None
 
     # ------------------------------------------------------------------
     # shared lookups (used to populate dropdowns)
@@ -271,8 +285,10 @@ class Database:
     # ==================================================================
     # STAFF OPERATIONS  -  all delegated to stored procedures
     # ==================================================================
-    def checkout_item(self, student_id, barcode, staff_id):
-        return self._run_two_out("sp_checkout_item", [student_id, barcode, staff_id])
+    def checkout_item(self, student_id, barcode, staff_id, lab_id=None):
+        return self._run_two_out("sp_checkout_item",
+                                 [student_id, barcode, staff_id,
+                                  int(lab_id) if lab_id else None])
 
     def return_item(self, barcode, staff_id):
         return self._run_two_out("sp_return_item", [barcode, staff_id])
@@ -281,8 +297,9 @@ class Database:
         return self._run_two_out("sp_log_attendance",
                                  [student_id, staff_id, lab_id, status])
 
-    def pay_penalty(self, student_id, penalty_id):
-        return self._run_two_out("sp_pay_penalty", [student_id, int(penalty_id)])
+    def pay_penalty(self, student_id, penalty_id, staff_id):
+        return self._run_two_out("sp_pay_penalty",
+                                 [student_id, int(penalty_id), staff_id])
 
     def check_overdue(self):
         """Run the overdue sweep. Returns the number of fresh alerts raised."""
@@ -290,6 +307,112 @@ class Database:
         self.cursor.execute("BEGIN sp_check_overdue(:1); END;", [cnt])
         value = cnt.getvalue()
         return int(value) if value is not None else 0
+
+        # ------------------------------------------------------------------
+    # concurrent-login lock (Active_Session table, see sp_session_*)
+    # ------------------------------------------------------------------
+    def session_login(self, username):
+        """Claim the one-session-per-account lock. Returns (result, message)."""
+        return self._run_two_out("sp_session_login", [username])
+
+    def session_logout(self, username):
+        """Release the lock."""
+        return self._run_two_out("sp_session_logout", [username])
+
+    def session_heartbeat(self, username):
+        """Refresh Last_seen so the session is not treated as stale."""
+        return self._run_two_out("sp_session_heartbeat", [username])
+
+    # ------------------------------------------------------------------
+    # report runners
+    #   Each returns (result, message, sections).
+    #   'sections' is a list of row-lists, one per cursor the procedure
+    #   opens, in the order documented on each method. It is [] on ERROR.
+    # ------------------------------------------------------------------
+    def _run_report(self, procedure, in_params, n_cursors):
+        """Call a report procedure shaped (..., cursors OUT, p_result, p_message)."""
+        try:
+            cursors = [self.cursor.var(oracledb.DB_TYPE_CURSOR) for _ in range(n_cursors)]
+            res = self.cursor.var(oracledb.DB_TYPE_VARCHAR, 40)
+            msg = self.cursor.var(oracledb.DB_TYPE_VARCHAR, 600)
+            binds = list(in_params) + cursors + [res, msg]
+            placeholders = ",".join(f":{i+1}" for i in range(len(binds)))
+            self.cursor.execute(f"BEGIN {procedure}({placeholders}); END;", binds)
+
+            result, message = res.getvalue(), msg.getvalue()
+            if result != "OK":
+                return result, message, []
+            sections = []
+            for c in cursors:
+                ref = c.getvalue()
+                sections.append(ref.fetchall())
+                ref.close()                      # release the server cursor
+            return result, message, sections
+        except Exception as exc:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return "ERROR", str(exc), []         # full text, not just line 1
+
+    def report_interval(self, start_text, end_text):
+        """Report A. Inputs are 'YYYY-MM-DD' strings, bound as datetime.date."""
+        try:
+            start = datetime.strptime((start_text or "").strip(), "%Y-%m-%d").date()
+            end = datetime.strptime((end_text or "").strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return "ERROR", "Invalid date. Please use the format YYYY-MM-DD.", []
+        return self._run_report("sp_report_interval", [start, end], 6)
+
+    def report_staff(self, staff_id):
+        """Report B.
+        Sections: 0 profile (single row), 1 labs supervised, 2 checkouts,
+                  3 checkouts per model, 4 dues collected."""
+        return self._run_report("sp_report_staff", [staff_id], 5)
+
+    def report_lab(self, lab_id):
+        """Report C. Uses its own fresh cursors and reports which stage failed."""
+        try:
+            lab_id = int(lab_id)
+        except (TypeError, ValueError):
+            return "ERROR", "Choose a lab first.", []
+
+        stage = "setup"
+        cur = None
+        refs = []
+        try:
+            self.conn.rollback()                 # end any open transaction first
+            cur = self.conn.cursor()
+            refs = [self.conn.cursor() for _ in range(6)]
+            res = cur.var(oracledb.DB_TYPE_VARCHAR, 40)
+            msg = cur.var(oracledb.DB_TYPE_VARCHAR, 600)
+
+            stage = "execute"
+            t0 = time.perf_counter()
+            cur.execute("BEGIN sp_report_lab(:1,:2,:3,:4,:5,:6,:7,:8,:9); END;",
+                        [lab_id] + refs + [res, msg])
+            print(f"[report_lab] execute {time.perf_counter() - t0:.2f}s")
+
+            if res.getvalue() != "OK":
+                return res.getvalue(), msg.getvalue(), []
+
+            sections = []
+            for i, ref in enumerate(refs):
+                stage = f"fetch cursor {i}"
+                t0 = time.perf_counter()
+                sections.append(ref.fetchall())
+                print(f"[report_lab] fetch {i}: {len(sections[-1])} rows, "
+                      f"{time.perf_counter() - t0:.2f}s")
+            return "OK", msg.getvalue(), sections
+        except Exception as exc:
+            return "ERROR", f"[{stage}] {exc}", []
+        finally:
+            for c in refs + [cur]:
+                try:
+                    if c is not None:
+                        c.close()
+                except Exception:
+                    pass
 
     # ---------------------------------------------------------------- staff views
     def get_active_borrows(self):
@@ -821,6 +944,19 @@ class LoginFrame(ctk.CTkFrame):
             self.password_entry.delete(0, "end")
             return
 
+        # Password is correct: now try to claim the account's single session.
+        # This runs only after authentication, so nobody can lock an account
+        # by guessing its username.
+        try:
+            status, message = self.db.session_login(username)
+        except Exception as exc:
+            status, message = "ERROR", str(exc).split("\n")[0]
+
+        if status != "OK":
+            self.hint.configure(text=message)
+            self.password_entry.delete(0, "end")
+            return
+
         role, ref_id = result
         self.hint.configure(text="")
         self.password_entry.delete(0, "end")
@@ -857,7 +993,7 @@ class DashboardBase(ctk.CTkFrame):
 
     def _identity_text(self):
         role = self.controller.current_user_role
-        who = self.controller.current_username
+        who = self.controller.current_display_name or self.controller.current_username
         ref = self.controller.current_ref_id or "-"
         unread = self.db.count_unread(role, self.controller.current_ref_id)
         alert = f"   |   {unread} unread alert(s)" if unread else ""
@@ -1202,7 +1338,8 @@ class StaffDashboard(DashboardBase):
                 f"for penalty #{penalty_id}?"):
             return
 
-        result, message = self.db.pay_penalty(student_id, penalty_id)
+        result, message = self.db.pay_penalty(
+            student_id, penalty_id, self.controller.current_ref_id)
         if result == "OK":
             messagebox.showinfo("Payment accepted", message)
         else:
@@ -1502,6 +1639,212 @@ class AdminDashboard(DashboardBase):
         self.rep_attend = sub.add("Attendance")
         self.rep_lab_attend = sub.add("Attendance by Lab")
         self.rep_dues = sub.add("Outstanding Dues")
+        self.rep_a = sub.add("Report A")
+        self.rep_b = sub.add("Report B")
+        self.rep_c = sub.add("Report C")
+
+        # ---- Report A: date interval
+        bar = ctk.CTkFrame(self.rep_a, fg_color="transparent")
+        bar.pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkLabel(bar, text="Report A - Date Interval",
+                     font=("Segoe UI", 15, "bold")).pack(side="left", padx=(0, 20))
+        ctk.CTkLabel(bar, text="Start").pack(side="left", padx=(0, 6))
+        self.rep_a_from = ctk.CTkEntry(bar, width=120, placeholder_text="YYYY-MM-DD")
+        self.rep_a_from.pack(side="left", padx=(0, 14))
+        ctk.CTkLabel(bar, text="End").pack(side="left", padx=(0, 6))
+        self.rep_a_to = ctk.CTkEntry(bar, width=120, placeholder_text="YYYY-MM-DD")
+        self.rep_a_to.pack(side="left", padx=(0, 14))
+        ctk.CTkButton(bar, text="Generate", width=110,
+                      command=self.run_report_a).pack(side="left")
+        self.rep_a_out = self._report_area(self.rep_a)
+
+        # ---- Report B: staff activity
+        bar = ctk.CTkFrame(self.rep_b, fg_color="transparent")
+        bar.pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkLabel(bar, text="Report B - Staff Activity",
+                     font=("Segoe UI", 15, "bold")).pack(side="left", padx=(0, 20))
+        ctk.CTkLabel(bar, text="Staff").pack(side="left", padx=(0, 6))
+        self.rep_b_pick = ctk.CTkComboBox(bar, values=[""], width=300)
+        self.rep_b_pick.pack(side="left", padx=(0, 14))
+        ctk.CTkButton(bar, text="Generate", width=110,
+                      command=self.run_report_b).pack(side="left")
+        self.rep_b_out = self._report_area(self.rep_b)
+
+        # ---- Report C: lab log
+        bar = ctk.CTkFrame(self.rep_c, fg_color="transparent")
+        bar.pack(fill="x", padx=8, pady=(8, 0))
+        ctk.CTkLabel(bar, text="Report C - Lab Log",
+                     font=("Segoe UI", 15, "bold")).pack(side="left", padx=(0, 20))
+        ctk.CTkLabel(bar, text="Lab").pack(side="left", padx=(0, 6))
+        self.rep_c_pick = ctk.CTkComboBox(bar, values=[""], width=340)
+        self.rep_c_pick.pack(side="left", padx=(0, 14))
+        ctk.CTkButton(bar, text="Generate", width=110,
+                      command=self.run_report_c).pack(side="left")
+        self.rep_c_out = self._report_area(self.rep_c)
+
+        self._refresh_report_pickers()
+
+        # ---------------------------------------------------------------- report helpers
+    def _report_area(self, tab):
+        area = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        area.pack(fill="both", expand=True, padx=4, pady=6)
+        return area
+
+    @staticmethod
+    def _clear_area(area):
+        for child in area.winfo_children():
+            child.destroy()
+
+    def _section(self, area, title, columns, rows, widths):
+        """Bold label + make_table, same stacking as the student attendance tab."""
+        ctk.CTkLabel(area, text=title, font=("Segoe UI", 13, "bold")
+                     ).pack(anchor="w", padx=8, pady=(12, 0))
+        height = 70 + 28 * min(max(len(rows), 1), 7)
+        holder = ctk.CTkFrame(area, fg_color="transparent", height=height)
+        holder.pack(fill="x")
+        holder.pack_propagate(False)
+        make_table(holder, columns, rows, widths=widths)
+
+    @staticmethod
+    def _summary_card(area, title, pairs):
+        """Label/value card, same look as the student 'Overall lab attendance' card."""
+        card = ctk.CTkFrame(area)
+        card.pack(fill="x", padx=8, pady=(10, 0))
+        ctk.CTkLabel(card, text=title, font=("Segoe UI", 14, "bold")
+                     ).pack(anchor="w", padx=14, pady=(12, 6))
+        for label, value in pairs:
+            status_row(label, value, card)
+        ctk.CTkLabel(card, text="", font=("Segoe UI", 4)).pack(pady=4)
+
+    @staticmethod
+    def _pick_id(combo):
+        return combo.get().split("  -  ")[0].strip()
+
+    def _refresh_report_pickers(self):
+        staff = [f"{sid}  -  {name}" for sid, name in self.db.get_staff_list()]
+        labs = [f"{lid}  -  {name} ({code})" for lid, name, code in self.db.get_labs()]
+        for combo, options in ((self.rep_b_pick, staff), (self.rep_c_pick, labs)):
+            combo.configure(values=options or [""])
+            if options and combo.get() not in options:
+                combo.set(options[0])
+
+    # ---------------------------------------------------------------- Report A
+    def run_report_a(self):
+        result, message, s = self.db.report_interval(
+            self.rep_a_from.get(), self.rep_a_to.get())
+        if result != "OK":
+            messagebox.showerror("Report A", message)
+            return
+
+        attendance, per_lab, checkouts, penalties, totals, active = s
+        area = self.rep_a_out
+        self._clear_area(area)
+
+        t = totals[0] if totals else (0, 0, 0, 0)
+        self._summary_card(area, "Summary for the selected interval", [
+            ("Attendance records", t[0]),
+            ("Items checked out", t[1]),
+            ("Penalties collected", t[2]),
+            ("Amount collected (Rs.)", t[3]),
+        ])
+        self._section(area, "Attendance logs",
+                      ["Date", "Student", "Name", "Lab", "Recorded by", "Status"],
+                      attendance, [110, 90, 160, 220, 140, 90])
+        self._section(area, "Attendance by lab (labs with 2+ records)",
+                      ["Lab", "Code", "Records", "Present", "Absent", "%"],
+                      per_lab, [250, 90, 90, 90, 90, 80])
+        self._section(area, "Equipment checkout logs",
+                      ["Date", "Student", "Name", "Model", "Barcode", "Due", "State", "Issued by"],
+                      checkouts, [105, 80, 130, 150, 100, 105, 80, 110])
+        self._section(area, "Penalties collected",
+                      ["Penalty #", "Student", "Name", "Amount (Rs.)", "Paid on",
+                       "Collected by", "Note"],
+                      penalties, [90, 80, 150, 110, 105, 130, 110])
+        self._section(area, "Students who attended a lab AND borrowed equipment",
+                      ["Student", "Name", "Department"],
+                      active, [100, 200, 200])
+
+    # ---------------------------------------------------------------- Report B
+    def run_report_b(self):
+        staff_id = self._pick_id(self.rep_b_pick)
+        if not staff_id:
+            messagebox.showerror("Report B", "Choose a staff member first.")
+            return
+        result, message, s = self.db.report_staff(staff_id)
+        if result != "OK":
+            messagebox.showerror("Report B", message)
+            return
+
+        profile, labs, checkouts, by_model, dues = s
+        area = self.rep_b_out
+        self._clear_area(area)
+
+        if profile:
+            p = profile[0]
+            self._summary_card(area, f"{p[1]}  ({p[0]})", [
+                ("Role", p[2]),
+                ("Department", p[3]),
+                ("Labs supervised", p[4]),
+                ("Items issued", p[5]),
+                ("Penalties collected", p[6]),
+                ("Dues collected (Rs.)", p[7]),
+                ("Share of all dues", f"{p[8]} %"),
+            ])
+        self._section(area, "Labs supervised or recorded",
+                      ["Lab id", "Lab", "Code"],
+                      labs, [80, 300, 100])
+        self._section(area, "Equipment checked out",
+                      ["Date", "Student", "Name", "Model", "Barcode", "Lab", "State"],
+                      checkouts, [105, 80, 140, 150, 100, 200, 80])
+        self._section(area, "Checkouts per model",
+                      ["Model", "Checkouts", "Still out", "First checkout"],
+                      by_model, [230, 100, 100, 130])
+        self._section(area, "Dues collected",
+                      ["Penalty #", "Student", "Name", "Amount (Rs.)", "Paid on"],
+                      dues, [90, 90, 180, 120, 120])
+
+    # ---------------------------------------------------------------- Report C
+    def run_report_c(self):
+        head = self.rep_c_pick.get().split("  -  ")[0].strip()
+        if not head.isdigit():
+            messagebox.showerror("Report C", "Choose a lab first.")
+            return
+
+        area = self.rep_c_out
+        self._clear_area(area)
+        ctk.CTkLabel(area, text="Generating report...",
+                     font=("Segoe UI", 12, "italic")).pack(anchor="w", padx=8, pady=12)
+        self.update_idletasks()                      # show the label before the DB call
+
+        t0 = time.perf_counter()
+        result, message, s = self.db.report_lab(int(head))
+        t1 = time.perf_counter()
+
+        self._clear_area(area)
+        if result != "OK":
+            messagebox.showerror("Report C", message)
+            return
+
+        sessions, staff, checkouts, enrolled, attendance, never = s
+        self._section(area, "Session dates",
+                      ["Date", "Marked", "Present", "Absent", "%"],
+                      sessions, [120, 90, 90, 90, 80])
+        self._section(area, "Staff present per session",
+                      ["Date", "Staff id", "Staff", "Marked"],
+                      staff, [120, 100, 200, 90])
+        self._section(area, "Equipment checked out for this lab",
+                      ["Date", "Student", "Name", "Model", "Barcode", "Issued by", "State"],
+                      checkouts, [105, 80, 140, 150, 100, 130, 80])
+        self._section(area, "Enrolled students",
+                      ["Student", "Name", "Sessions", "Present", "%", "Standing"],
+                      enrolled, [90, 190, 90, 90, 80, 140])
+        self._section(area, "Attendance records",
+                      ["Date", "Student", "Name", "Recorded by", "Status"],
+                      attendance, [120, 90, 190, 150, 100])
+        self._section(area, "Enrolled but never present",
+                      ["Student", "Name"],
+                      never, [100, 220])
+        print(f"[Report C] database {t1 - t0:.2f}s, drawing {time.perf_counter() - t1:.2f}s")
 
     # ---------------------------------------------------------------- shared
     def _report(self, ok, message, on_success):
@@ -1558,6 +1901,8 @@ class AdminDashboard(DashboardBase):
                    self.db.get_defaulter_table(),
                    widths=[90, 220, 110, 130, 110])
 
+        self._refresh_report_pickers()
+
         self.notifications_panel(self.tab_alerts)
 
 
@@ -1577,6 +1922,8 @@ class ALEAMApp(ctk.CTk):
         self.current_username = None
         self.current_user_role = None
         self.current_ref_id = None
+        self._hb_job = None
+        self.current_display_name = None
 
         self.frames = {}
         self.grid_rowconfigure(0, weight=1)
@@ -1607,6 +1954,7 @@ class ALEAMApp(ctk.CTk):
         self.current_username = username
         self.current_user_role = role
         self.current_ref_id = ref_id
+        self.current_display_name = self.db.get_display_name(role, ref_id) or username
 
         if role == "STUDENT":
             self.show_frame("StudentDashboard")
@@ -1614,6 +1962,9 @@ class ALEAMApp(ctk.CTk):
             self.show_frame("StaffDashboard")
         else:
             self.show_frame("AdminDashboard")
+
+        self._stop_heartbeat()
+        self._hb_job = self.after(30000, self._heartbeat)      # every 30 s
 
         self.frames[self._active_frame_name()].announce_pending_alerts()
 
@@ -1627,14 +1978,51 @@ class ALEAMApp(ctk.CTk):
     def logout(self):
         if not messagebox.askyesno("Log out", "Log out of ALEAM?"):
             return
+        self._release_session()
         self.current_username = None
         self.current_user_role = None
         self.current_ref_id = None
         self.show_frame("LoginFrame")
 
     def on_close(self):
+        self._release_session()
         self.db.close()
         self.destroy()
+
+        # ---------------------------------------------------------------- lock upkeep
+    def _release_session(self):
+        """Stop the heartbeat and free this account's lock."""
+        self._stop_heartbeat()
+        if self.current_username:
+            try:
+                self.db.session_logout(self.current_username)
+            except Exception:
+                pass            # the 2-minute stale timeout will clean up
+
+    def _stop_heartbeat(self):
+        if self._hb_job is not None:
+            self.after_cancel(self._hb_job)
+            self._hb_job = None
+
+    def _heartbeat(self):
+        """Refresh Last_seen; if the lock was lost to another window, sign out."""
+        self._hb_job = None
+        if not self.current_username:
+            return
+        try:
+            status, message = self.db.session_heartbeat(self.current_username)
+        except Exception:
+            status, message = "OK", ""      # transient DB hiccup: retry next tick
+
+        if status != "OK":
+            self.current_username = None
+            self.current_user_role = None
+            self.current_ref_id = None
+            self.show_frame("LoginFrame")
+            messagebox.showwarning("Signed out", message)
+            return
+
+        self._hb_job = self.after(30000, self._heartbeat)
 
 
 def main():
