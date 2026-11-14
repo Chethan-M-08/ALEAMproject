@@ -1391,12 +1391,16 @@ class AdminDashboard(DashboardBase):
         self.tab_staff = self.tabs.add("Staff")
         self.tab_equip = self.tabs.add("Equipment")
         self.tab_reports = self.tabs.add("Reports")
+        self.tab_sql = self.tabs.add("SQL Runner")
         self.tab_alerts = self.tabs.add("Notifications")
 
         self._build_students()
         self._build_staff()
         self._build_equipment()
         self._build_reports()
+        self._build_sql_runner()
+        self.tabs.configure(command=lambda: self._reset_sql_runner()
+                            if self.tabs.get() == "SQL Runner" else None)
 
     # ---------------------------------------------------------------- helpers
     def _dept_options(self):
@@ -1846,6 +1850,101 @@ class AdminDashboard(DashboardBase):
                       never, [100, 220])
         print(f"[Report C] database {t1 - t0:.2f}s, drawing {time.perf_counter() - t1:.2f}s")
 
+        # ---------------------------------------------------------------- SQL Runner
+    def _build_sql_runner(self):
+        ctk.CTkLabel(self.tab_sql, text="SQL Runner",
+                     font=("Segoe UI", 15, "bold")).pack(anchor="w", padx=12, pady=(10, 2))
+        self.sql_box = ctk.CTkTextbox(self.tab_sql, height=150, font=("Consolas", 13))
+        self.sql_box.pack(fill="x", padx=12, pady=(4, 6))
+
+        bar = ctk.CTkFrame(self.tab_sql, fg_color="transparent")
+        bar.pack(fill="x", padx=12)
+        ctk.CTkButton(bar, text="Run", width=110,
+                      command=self.run_custom_sql).pack(side="left")
+        ctk.CTkButton(bar, text="Clear", width=90, fg_color="gray35", hover_color="gray25",
+                      command=lambda: self.sql_box.delete("1.0", "end")
+                      ).pack(side="left", padx=8)
+        self.sql_status = ctk.CTkLabel(bar, text="", font=("Segoe UI", 12), anchor="w")
+        self.sql_status.pack(side="left", padx=12)
+
+        # make_table() clears its parent, so results get their own holder frame.
+        self.sql_out = ctk.CTkFrame(self.tab_sql, fg_color="transparent")
+        self.sql_out.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def run_custom_sql(self):
+        import re
+        sql = self.sql_box.get("1.0", "end").strip()
+        if not sql:
+            return
+
+        # Drop a trailing "/" line (SQL Developer habit).
+        sql = re.sub(r"\n\s*/\s*$", "", sql).strip()
+        upper = sql.upper()
+        head = upper.split(None, 1)[0]
+
+        # PL/SQL blocks and CREATE PROCEDURE/FUNCTION/TRIGGER keep their final ';'.
+        # Plain SQL must not have one (ORA-00933).
+        is_plsql = head in ("BEGIN", "DECLARE") or re.match(
+            r"CREATE\s+(OR\s+REPLACE\s+)?(PROCEDURE|FUNCTION|TRIGGER|PACKAGE|TYPE)\b", upper)
+        if not is_plsql:
+            sql = sql.rstrip(";").rstrip()
+
+        risky = head in ("DROP", "TRUNCATE", "ALTER") or \
+                (head == "DELETE" and "WHERE" not in upper)
+        if risky and not messagebox.askyesno(
+                "Confirm", "This statement can destroy data or structure.\n\nRun it anyway?"):
+            return
+
+        db = self.db
+        for child in self.sql_out.winfo_children():
+            child.destroy()
+        self.sql_status.configure(text="Running...", text_color=("gray90", "gray90"))
+        self.update_idletasks()
+
+        try:
+            t0 = time.perf_counter()
+            db.cursor.execute(sql)
+            took = time.perf_counter() - t0
+
+            if db.cursor.description:                       # SELECT / WITH: has columns
+                cols = [d[0] for d in db.cursor.description]
+                rows = db.cursor.fetchmany(501)
+                capped = len(rows) > 500
+                rows = rows[:500]
+
+                widths = []
+                for i, c in enumerate(cols):
+                    longest = max([len(c)] + [len("" if r[i] is None else str(r[i]))
+                                              for r in rows[:100]])
+                    widths.append(min(320, max(90, longest * 9 + 10)))
+
+                make_table(self.sql_out, cols, rows, widths=widths)
+                note = f"{len(rows)} row(s) in {took:.2f}s"
+                if capped:
+                    note += "  (showing first 500 only)"
+                self.sql_status.configure(text=note, text_color="#2fa572")
+            else:                                           # DML / DDL / PL-SQL
+                affected = db.cursor.rowcount
+                db.conn.commit()                            # harmless after DDL
+                note = (f"OK - {affected} row(s) affected, committed ({took:.2f}s)"
+                        if affected and affected > 0
+                        else f"Statement executed and committed ({took:.2f}s)")
+                self.sql_status.configure(text=note, text_color="#2fa572")
+        except Exception as exc:
+            try:
+                db.conn.rollback()
+            except Exception:
+                pass
+            self.sql_status.configure(text="Failed - see the error dialog.",
+                                      text_color="#b5533c")
+            messagebox.showerror("SQL error", str(exc))
+
+    def _reset_sql_runner(self):
+        """Wipe the query box, the status line and the results table."""
+        self.sql_box.delete("1.0", "end")
+        self.sql_status.configure(text="")
+        for child in self.sql_out.winfo_children():
+            child.destroy()
     # ---------------------------------------------------------------- shared
     def _report(self, ok, message, on_success):
         if ok:
@@ -1901,6 +2000,7 @@ class AdminDashboard(DashboardBase):
                    self.db.get_defaulter_table(),
                    widths=[90, 220, 110, 130, 110])
 
+        self._reset_sql_runner()
         self._refresh_report_pickers()
 
         self.notifications_panel(self.tab_alerts)
